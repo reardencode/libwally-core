@@ -163,6 +163,7 @@ extern "C" {
 #define OP_NOP2 0xb1
 #define OP_CHECKSEQUENCEVERIFY 0xb2
 #define OP_NOP3 0xb2
+#define OP_CHECKTEMPLATEVERIFY 0xb3
 #define OP_NOP4 0xb3
 #define OP_NOP5 0xb4
 #define OP_NOP6 0xb5

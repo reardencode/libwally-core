@@ -58,6 +58,7 @@ struct tx_serialize_opts
     uint32_t codesep_position;       /* BIP342 codeseparator position */
     const unsigned char *annex;      /* Annex data to be put under sighash */
     size_t annex_len;                /* Length of sighash data, including 0x50 prefix */
+    bool bip119;                     /* Serialize for BIP119 DefaultCheckTemplateVerifyHash */
 };
 
 static const unsigned char EMPTY_OUTPUT[9] = {
@@ -1713,6 +1714,24 @@ static int tx_get_lengths(const struct wally_tx *tx,
         if (flags & WALLY_TX_FLAG_USE_WITNESS)
             return WALLY_ERROR; /* Segwit tx hashing uses bip143 opts member */
 
+        if (opts->bip119) {
+            *base_size = sizeof(uint32_t) + /* version */
+                         sizeof(uint32_t) + /* locktime */
+                         sizeof(uint32_t) + /* nInputs */
+                         SHA256_LEN + /* hash sequences */
+                         sizeof(uint32_t) + /* nOutputs */
+                         SHA256_LEN + /* hash outputs */
+                         sizeof(uint32_t); /* in index */
+            for (i = 0; i < tx->num_inputs; ++i) {
+                if (tx->inputs[i].script_len != 0) {
+                    *base_size += SHA256_LEN; /* hash script sigs */
+                    break;
+                }
+            }
+            return WALLY_OK;
+        }
+
+
         if (opts->bip341) {
             *base_size = get_bip341_size(opts->tx_sighash, opts->annex_len != 0,
                                          opts->ext_flag);
@@ -2261,6 +2280,94 @@ error:
     return ret;
 }
 
+static inline int tx_to_bip119_bytes(const struct wally_tx *tx,
+                                     const struct tx_serialize_opts *opts,
+                                     unsigned char *bytes_out,
+                                     size_t *written)
+{
+    unsigned char buff[TX_STACK_SIZE / 2], *buff_p = buff;
+    size_t i, script_sigs_size, outputs_size, buff_len = sizeof(buff);
+    unsigned char *p = bytes_out, *output_p;
+    int ret = WALLY_OK;
+
+    /* Note we assume tx_to_bytes has already validated all inputs */
+
+    script_sigs_size = 0;
+    for (i = 0; i < tx->num_inputs; ++i) {
+        const struct wally_tx_input *input = tx->inputs + i;
+        script_sigs_size += varbuff_get_length(input->script_len);
+    }
+
+    outputs_size = 0;
+    for (i = 0; i < tx->num_outputs; ++i) {
+        const struct wally_tx_output *output = tx->outputs + i;
+        outputs_size += sizeof(uint64_t) + varbuff_get_length(output->script_len);
+    }
+
+    if (script_sigs_size > buff_len || outputs_size > buff_len) {
+        buff_len = script_sigs_size > outputs_size ? script_sigs_size : outputs_size;
+        buff_p = wally_malloc(buff_len);
+        if (buff_p == NULL)
+            return WALLY_ENOMEM;
+    }
+
+    /* version and locktime */
+    p += uint32_to_le_bytes(tx->version, p);
+    p += uint32_to_le_bytes(tx->locktime, p);
+
+    /* Script Sigs */
+    // skip if all script sigs are the empty buffer
+    if (script_sigs_size != sizeof(uint8_t) * tx->num_inputs) {
+        unsigned char *tmp_p = buff_p;
+        for (i = 0; i < tx->num_inputs; ++i) {
+            const struct wally_tx_input *input = tx->inputs + i;
+            tmp_p += varbuff_to_bytes(input->script, input->script_len, tmp_p);
+        }
+
+        if ((ret = wally_sha256d(buff_p, tmp_p - buff_p, p, SHA256_LEN)) != WALLY_OK)
+            goto error;
+        p += SHA256_LEN;
+    }
+
+    /* nInputs */
+    p += uint32_to_le_bytes(tx->num_inputs, p);
+
+    /* Sequences */
+    for (i = 0; i < tx->num_inputs; ++i)
+        uint32_to_le_bytes(tx->inputs[i].sequence, buff_p + i * sizeof(uint32_t));
+
+    ret = wally_sha256d(buff_p, tx->num_inputs * sizeof(uint32_t), p, SHA256_LEN);
+    if (ret != WALLY_OK)
+        goto error;
+    p += SHA256_LEN;
+
+    /* nOoutputs */
+    p += uint32_to_le_bytes(tx->num_outputs, p);
+
+    /* Outputs */
+    output_p = buff_p;
+    for (i = 0; i < tx->num_outputs; ++i) {
+        output_p += uint64_to_le_bytes(tx->outputs[i].satoshi, output_p);
+        output_p += varbuff_to_bytes(tx->outputs[i].script,
+                                     tx->outputs[i].script_len, output_p);
+    }
+    ret = wally_sha256d(buff_p, outputs_size, p, SHA256_LEN);
+    if (ret != WALLY_OK)
+        goto error;
+    p += SHA256_LEN;
+
+    p += uint32_to_le_bytes(opts->index, p);
+
+    *written = p - bytes_out;
+
+error:
+    if (buff_p != buff)
+        clear_and_free(buff_p, buff_len);
+    else
+        wally_clear(buff, sizeof(buff));
+    return ret;
+}
+
 static bool tr_is_input_hash_type(uint32_t sighash, uint32_t hash_type)
 {
     return (sighash & WALLY_SIGHASH_TR_IN_MASK) == hash_type;
@@ -2536,6 +2643,9 @@ static int tx_to_bytes(const struct wally_tx *tx,
         *written = n;
         return WALLY_OK;
     }
+
+    if (opts && opts->bip119)
+        return tx_to_bip119_bytes(tx, opts, bytes_out, written);
 
     if (opts && opts->bip143)
         return tx_to_bip143_bytes(tx, opts, flags, bytes_out, len, written);
@@ -3196,6 +3306,49 @@ int wally_tx_is_coinbase(const struct wally_tx *tx, size_t *written)
     return WALLY_OK;
 }
 
+int wally_tx_get_bip119_hash(const struct wally_tx *tx,
+                             size_t index,
+                             unsigned char *bytes_out, size_t len)
+{
+    unsigned char buff[TX_STACK_SIZE], *buff_p = buff;
+    size_t n, n2;
+    int ret;
+    const struct tx_serialize_opts opts = {
+        0, 0, index, NULL, 0, 0,
+        false, NULL, 0, false, 0, NULL, 0, NULL,
+        NULL, 0, 0, 0, NULL, 0, false
+    };
+
+    if (!is_valid_tx(tx) || !bytes_out || len < SHA256_LEN)
+        return WALLY_EINVAL;
+
+    if (index >= tx->num_inputs)
+        return WALLY_EINVAL;
+
+    if ((ret = tx_get_length(tx, &opts, 0, &n, false)) != WALLY_OK)
+        goto fail;
+
+    if (n > sizeof(buff) && (buff_p = wally_malloc(n)) == NULL) {
+        ret = WALLY_ENOMEM;
+        goto fail;
+    }
+
+    if ((ret = tx_to_bytes(tx, &opts, 0, buff_p, n, &n2, false)) != WALLY_OK)
+        goto fail;
+
+    if (n != n2)
+        ret = WALLY_ERROR; /* tx_get_length/tx_to_bytes mismatch, should not happen! */
+    else
+        ret = wally_sha256d(buff_p, n2, bytes_out, len);
+
+fail:
+    if (buff_p != buff)
+        clear_and_free(buff_p, n);
+    else
+        wally_clear(buff, sizeof(buff));
+    return ret;
+}
+
 static int tx_get_signature_hash(const struct wally_tx *tx,
                                  size_t index,
                                  const unsigned char *script, size_t script_len,
@@ -3215,7 +3368,7 @@ static int tx_get_signature_hash(const struct wally_tx *tx,
     const struct tx_serialize_opts opts = {
         sighash, tx_sighash, index, script, script_len, satoshi,
         is_bip143, value, value_len, is_bip341, ext_flag, NULL, 0, NULL,
-        NULL, 0, 0, 0, NULL, 0
+        NULL, 0, 0, 0, NULL, 0, false
     };
 
     if (!is_valid_tx(tx) || BYTES_INVALID(script, script_len) ||
@@ -3304,7 +3457,7 @@ int wally_tx_get_btc_taproot_signature_hash(
         values && index < num_values ? values[index] : 0,
         is_bip143, NULL, 0, is_bip341, tapleaf_script ? EXT_FLAG_BIP342 : 0,
         values, num_values, scripts, tapleaf_script, tapleaf_script_len,
-        key_version, codesep_position, annex, annex_len
+        key_version, codesep_position, annex, annex_len, false
     };
     size_t is_elements, n, n2;
     int ret;

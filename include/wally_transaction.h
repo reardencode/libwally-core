@@ -804,6 +804,21 @@ WALLY_CORE_API int wally_tx_get_btc_taproot_signature_hash(
     size_t len);
 
 /**
+ * Create a transaction for signing and return its bip119 default check
+ * template verify hash.
+ *
+ * :param tx: The transaction to generate the signature hash from.
+ * :param index: The input index of the input being signed for.
+ * :param bytes_out: Destination for the signature hash.
+ * FIXED_SIZED_OUTPUT(len, bytes_out, SHA256_LEN)
+ */
+WALLY_CORE_API int wally_tx_get_bip119_hash(
+    const struct wally_tx *tx,
+    size_t index,
+    unsigned char *bytes_out,
+    size_t len);
+
+/**
  * Create a transaction for signing and return its hash.
  *
  * :param tx: The transaction to generate the signature hash from.
